@@ -1,7 +1,10 @@
 .env
+.env.*
+!.env.example
 venv/
 __pycache__/
 *.pyc
 workspace/
 workspace_repo/
+*.bak
 .DS_Store
