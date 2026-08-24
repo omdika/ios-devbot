@@ -1,0 +1,9 @@
+services:
+  telegram-ai-agent:
+    build: .
+    container_name: telegram-ai-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./workspace:/app/workspace
