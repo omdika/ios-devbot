@@ -32,6 +32,7 @@ BASE_WORKSPACE = os.getenv("WORKSPACE_DIR", "./workspace")
 BACKEND_DIR = os.path.join(BASE_WORKSPACE, "backend")
 IOS_DIR = os.path.join(BASE_WORKSPACE, "ios")
 
+# Inisialisasi Vertex AI client
 ai_client = genai.Client(
     vertexai=True,
     project=os.getenv("GCP_PROJECT_ID", "ivory-oarlock-482401-n5"),
@@ -48,6 +49,7 @@ user_message_queues = dict()
 
 
 def scan_repo_files(repo_path: str, repo_label: str) -> str:
+    """Fungsi synchronous untuk membaca seluruh file penting di repositori."""
     if not os.path.exists(repo_path):
         return ""
     context = list()
@@ -74,8 +76,35 @@ def scan_repo_files(repo_path: str, repo_label: str) -> str:
 
 
 async def apply_ai_changes_streaming(user_id: int, prompt: str, images_bytes_list: list, status_msg, context: ContextTypes.DEFAULT_TYPE) -> str:
-    backend_context = scan_repo_files(BACKEND_DIR, "backend")
-    ios_context = scan_repo_files(IOS_DIR, "ios") if IOS_REPO_NAME else "No iOS repo configured."
+    # 1. Pastikan inisialisasi sesi user lengkap
+    if user_id not in user_sessions:
+        user_sessions[user_id] = {
+            "history": list(),
+            "active_branch": None,
+            "codebase_snapshot": None  # Menyimpan cache scan agar tidak scan ulang terus-menerus
+        }
+
+    session = user_sessions[user_id]
+
+    # 2. Cek apakah sudah ada cache codebase di sesi aktif ini
+    if not session.get("codebase_snapshot"):
+        await status_msg.edit_text("🔍 [2/4] Melakukan scanning codebase pertama kali (membuat cache memori)...")
+        
+        # Jalankan scan di thread terpisah agar proses I/O tidak memblokir event loop asyncio utama
+        loop = asyncio.get_running_loop()
+        backend_context = await loop.run_in_executor(None, scan_repo_files, BACKEND_DIR, "backend")
+        ios_context = await loop.run_in_executor(None, scan_repo_files, IOS_DIR, "ios") if IOS_REPO_NAME else "No iOS repo configured."
+        
+        # Simpan hasil scan ke memori sesi
+        session["codebase_snapshot"] = {
+            "backend": backend_context,
+            "ios": ios_context
+        }
+    else:
+        # Gunakan cache memori yang sudah tersimpan sebelumnya
+        await status_msg.edit_text("🧠 [2/4] Menggunakan cache codebase yang tersimpan di sesi...")
+        backend_context = session["codebase_snapshot"]["backend"]
+        ios_context = session["codebase_snapshot"]["ios"]
 
     system_instruction = (
         "Kamu adalah Senior Fullstack AI Engineer handal (Python Backend & iOS Swift/SwiftUI).\n"
@@ -97,13 +126,9 @@ async def apply_ai_changes_streaming(user_id: int, prompt: str, images_bytes_lis
         "Jika prompt HANYA diskusi atau analisis tanpa perlu perubahan kode, berikan penjelasan ringkas dan JANGAN buat blok REPO:/FILE:."
     )
 
-    if user_id not in user_sessions:
-        user_sessions[user_id] = {
-            "history": list(),
-            "active_branch": None
-        }
-
-    history = user_sessions[user_id]["history"]
+    history = session["history"]
+    
+    # Hanya kirimkan snapshot codebase lengkap pada konteks prompt aktif saat ini
     current_text = (
         f"[BACKEND CODEBASE SNAPSHOT]:\n{backend_context}\n\n"
         f"[IOS CODEBASE SNAPSHOT]:\n{ios_context}\n\n"
@@ -139,7 +164,7 @@ async def apply_ai_changes_streaming(user_id: int, prompt: str, images_bytes_lis
             raw_text += chunk.text
             chunk_count += 1
             
-            # Update status di Telegram setiap 2 detik agar tidak kena rate limit
+            # Update status di Telegram setiap 2 detik agar tidak terkena rate limit API Telegram
             if time.time() - last_edit_time > 2.0:
                 last_edit_time = time.time()
                 lines = raw_text.strip().splitlines()
@@ -154,11 +179,12 @@ async def apply_ai_changes_streaming(user_id: int, prompt: str, images_bytes_lis
                 except Exception:
                     pass
 
+    # Simpan riwayat obrolan (tanpa codebase snapshot raksasa agar menghemat memori riwayat)
     history.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
     history.append(types.Content(role="model", parts=[types.Part.from_text(text=raw_text)]))
 
     if len(history) > 16:
-        user_sessions[user_id]["history"] = history[-16:]
+        session["history"] = history[-16:]
 
     # Parsing pembuatan file ke disk lokal
     sections = raw_text.split("REPO:")
@@ -217,15 +243,16 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ALLOWED_USER_ID:
         await update.message.reply_text("⛔ Akses ditolak.")
         return
-    await update.message.reply_text("👋 Halo! AI Agent siap dengan Real-time Streaming Logs.")
+    await update.message.reply_text("👋 Halo! AI Agent siap dengan Real-time Streaming Logs & Codebase Cache.")
 
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ALLOWED_USER_ID:
         return
+    # Menghapus seluruh sesi termasuk memori chat dan cache codebase
     user_sessions.pop(user_id, None)
-    await update.message.reply_text("🔄 Sesi & Memori di-reset!")
+    await update.message.reply_text("🔄 Sesi & Memori Codebase di-reset! Perintah berikutnya akan melakukan scan ulang.")
 
 
 async def execute_task(chat_id: int, user_id: int, prompt: str, images: list, message_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -239,7 +266,12 @@ async def execute_task(chat_id: int, user_id: int, prompt: str, images: list, me
         )
 
         try:
-            session = user_sessions.setdefault(user_id, {"history": list(), "active_branch": None})
+            session = user_sessions.setdefault(user_id, {
+                "history": list(),
+                "active_branch": None,
+                "codebase_snapshot": None
+            })
+            
             if not session["active_branch"]:
                 backend_git = sync_repo(BACKEND_REPO_NAME, BACKEND_DIR)
                 ios_git = sync_repo(IOS_REPO_NAME, IOS_DIR) if IOS_REPO_NAME else None
@@ -261,7 +293,7 @@ async def execute_task(chat_id: int, user_id: int, prompt: str, images: list, me
                 if ios_git:
                     ios_git.git.checkout(branch_name)
 
-            await status_msg.edit_text("🧠 [2/4] Terhubung ke Vertex AI GCP (Memulai Streaming)...")
+            await status_msg.edit_text("🧠 [2/4] Menghubungkan ke Vertex AI GCP...")
             explanation = await apply_ai_changes_streaming(user_id, prompt, images, status_msg, context)
 
             backend_changed = backend_git and backend_git.is_dirty(untracked_files=True)
@@ -369,7 +401,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.from_user.id != ALLOWED_USER_ID:
+    user_id = query.from_user.id
+    if user_id != ALLOWED_USER_ID:
         return
 
     data = query.data
@@ -377,11 +410,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("merge_be_"):
             pr_num = int(data.replace("merge_be_", ""))
             gh_backend_repo.get_pull(pr_num).merge(commit_message=f"Merged AI Backend PR #{pr_num}")
-            await query.edit_message_text(f"🎉 PR Backend #{pr_num} berhasil di-merge!")
+            
+            # Reset cache codebase agar di-scan ulang di perintah berikutnya karena kode sudah di-merge
+            if user_id in user_sessions:
+                user_sessions[user_id]["codebase_snapshot"] = None
+                user_sessions[user_id]["active_branch"] = None
+                
+            await query.edit_message_text(f"🎉 PR Backend #{pr_num} berhasil di-merge! Cache codebase dibersihkan.")
+            
         elif data.startswith("merge_ios_"):
             pr_num = int(data.replace("merge_ios_", ""))
             gh_ios_repo.get_pull(pr_num).merge(commit_message=f"Merged AI iOS PR #{pr_num}")
-            await query.edit_message_text(f"🎉 PR iOS #{pr_num} berhasil di-merge!")
+            
+            if user_id in user_sessions:
+                user_sessions[user_id]["codebase_snapshot"] = None
+                user_sessions[user_id]["active_branch"] = None
+                
+            await query.edit_message_text(f"🎉 PR iOS #{pr_num} berhasil di-merge! Cache codebase dibersihkan.")
+            
     except Exception as e:
         await query.edit_message_text(f"❌ Gagal merge: {str(e)}")
 
