@@ -1,3 +1,5 @@
+[![View All Projects](https://img.shields.io/badge/View_All_Projects-omdika.github.io-blue?style=flat-square&logo=github)](https://omdika.github.io/)
+
 # Telegram iOS Development AI Agent
 
 An AI-powered Telegram coding agent connected to **Google Cloud Vertex AI (Gemini)** for automating iOS development with **Swift and SwiftUI** directly through GitHub pull requests.
