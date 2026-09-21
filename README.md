@@ -2,6 +2,9 @@
 
 # Telegram iOS Development AI Agent
 
+<img width="502" height="367" alt="image" src="https://github.com/user-attachments/assets/10238247-5747-4e12-8305-afd18dafadb1" />
+
+
 An AI-powered Telegram coding agent connected to **Google Cloud Vertex AI (Gemini)** for automating iOS development with **Swift and SwiftUI** directly through GitHub pull requests.
 
 The agent is designed to help iOS developers turn natural-language instructions, screenshots, and UI references into production-ready code changes. It can inspect an existing iOS codebase, update or create Swift files, and open a pull request for review—all from Telegram.
